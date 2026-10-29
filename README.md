@@ -108,6 +108,4 @@ Os Termos de Serviço do YouTube não permitem baixar conteúdo fora dos recurso
 - [PySide6 / Qt](https://doc.qt.io/qtforpython-6/), a interface gráfica
 - [PyInstaller](https://pyinstaller.org/), o empacotamento
 
-## Licença
 
-<!-- Escolha uma licença e coloque aqui, por exemplo: Distribuído sob a licença MIT. Veja o arquivo LICENSE. -->
