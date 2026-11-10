@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SomDeMala — interface gráfica
+SomDeMala — interface gráfica para baixar músicas (MP3) e vídeos (MP4) do YouTube
 
 Rodando direto pelo Python (Ubuntu):
     sudo apt install ffmpeg libxcb-cursor0
@@ -20,17 +20,30 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+
 
 # ----------------------------------------------------------------------------
 # Pastas de dados (funciona em Linux, Windows e macOS)
 # ----------------------------------------------------------------------------
-if sys.platform.startswith("win"):
-    DADOS = Path(os.environ.get("APPDATA", Path.home())) / "SomDeMala"
-elif sys.platform == "darwin":
-    DADOS = Path.home() / "Library" / "Application Support" / "SomDeMala"
-else:
-    DADOS = Path.home() / ".local" / "share" / "baixador-playlist"
+def _pasta_dados():
+    if sys.platform.startswith("win"):
+        return Path(os.environ.get("APPDATA", Path.home())) / "SomDeMala"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "SomDeMala"
+    base = Path.home() / ".local" / "share"
+    nova, antiga = base / "SomDeMala", base / "baixador-playlist"
+    if antiga.is_dir() and not nova.exists():   # migra o nome antigo do projeto
+        try:
+            antiga.rename(nova)
+        except OSError:
+            return antiga
+    return nova
+
+
+DADOS = _pasta_dados()
 ARQ_HIST = DADOS / "historico.json"
+ARQ_HIST_VIDEO = DADOS / "historico_video.json"
 ARQ_CONF = DADOS / "config.json"
 
 
@@ -50,16 +63,16 @@ try:
     from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QPoint, QPointF,
                                 QPropertyAnimation, QSequentialAnimationGroup, QSize, Qt,
                                 QThread, QTimer, QUrl, Signal)
-    from PySide6.QtGui import (QColor, QConicalGradient, QDesktopServices, QPainter, QPen,
-                               QRadialGradient)
-    from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QGraphicsOpacityEffect,
-                                   QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                                   QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider,
-                                   QSizePolicy, QSplitter, QSplitterHandle, QToolButton,
-                                   QVBoxLayout, QWidget)
+    from PySide6.QtGui import (QColor, QConicalGradient, QDesktopServices, QKeySequence,
+                               QPainter, QPen, QRadialGradient, QShortcut)
+    from PySide6.QtWidgets import (QApplication, QButtonGroup, QFileDialog, QFrame,
+                                   QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit,
+                                   QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
+                                   QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter,
+                                   QSplitterHandle, QStackedWidget, QToolButton, QVBoxLayout,
+                                   QWidget)
 except ImportError:
     sys.exit("PySide6 não encontrado. Rode: pip install -U PySide6")
-
 
 
 def pasta_do_app():
@@ -80,6 +93,46 @@ FFMPEG_DIR = localizar_ffmpeg()
 
 
 # ----------------------------------------------------------------------------
+# Textos de cada aba
+# ----------------------------------------------------------------------------
+TEXTOS = {
+    "audio": {
+        "aba": "♪  Música",
+        "titulo": "Baixar músicas",
+        "sub": "Playlist ou música avulsa, salva em MP3 com capa e informações.",
+        "placeholder": "Cole aqui o link da playlist ou da música do YouTube",
+        "ocioso": "Cole um link acima e clique em Baixar.\nO progresso de cada música aparece aqui.",
+        "vazio": "Nenhuma música baixada ainda.\nO que você baixar vai aparecer aqui.",
+        "item": "música", "itens": "músicas",
+        "nenhum": "Nenhuma música pôde ser baixada. Confira o link e a sua conexão.",
+    },
+    "video": {
+        "aba": "▶  Vídeo",
+        "titulo": "Baixar vídeos",
+        "sub": "Vídeo avulso ou playlist inteira, salvo em MP4 na qualidade escolhida.",
+        "placeholder": "Cole aqui o link do vídeo ou da playlist do YouTube",
+        "ocioso": "Cole um link acima e clique em Baixar.\nO progresso de cada vídeo aparece aqui.",
+        "vazio": "Nenhum vídeo baixado ainda.\nO que você baixar vai aparecer aqui.",
+        "item": "vídeo", "itens": "vídeos",
+        "nenhum": "Nenhum vídeo pôde ser baixado. Confira o link e a sua conexão.",
+    },
+}
+
+# altura máxima em pixels (0 = a melhor que existir)
+QUALIDADES = [(0, "Melhor"), (1080, "1080p"), (720, "720p"), (480, "480p"), (360, "360p")]
+QUALIDADE_PADRAO = 1080
+
+# nomes internos dos pós-processadores do yt-dlp -> o que mostrar na tela
+ETAPAS = {
+    "ExtractAudio": "Convertendo para MP3",
+    "Merger": "Juntando vídeo e áudio",
+    "VideoRemuxer": "Ajustando para MP4",
+    "Metadata": "Gravando as informações",
+    "EmbedThumbnail": "Colocando a capa",
+}
+
+
+# ----------------------------------------------------------------------------
 # Utilitários
 # ----------------------------------------------------------------------------
 def ler_json(caminho, padrao):
@@ -94,23 +147,64 @@ def gravar_json(caminho, dados):
     caminho.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def pasta_musica_padrao():
+def pasta_padrao(tipo):
+    if tipo == "video":
+        xdg, nomes, sub = "VIDEOS", ("Vídeos", "Videos"), "YouTube"
+    else:
+        xdg, nomes, sub = "MUSIC", ("Música", "Music", "Músicas"), "Playlists YouTube"
     if sys.platform.startswith("linux"):
         try:
-            saida = subprocess.run(["xdg-user-dir", "MUSIC"], capture_output=True,
+            saida = subprocess.run(["xdg-user-dir", xdg], capture_output=True,
                                    text=True, timeout=2).stdout.strip()
             if saida and saida != str(Path.home()):
-                return Path(saida) / "Playlists YouTube"
+                return Path(saida) / sub
         except Exception:
             pass
-    for nome in ("Música", "Music", "Músicas"):
+    for nome in nomes:
         if (Path.home() / nome).is_dir():
-            return Path.home() / nome / "Playlists YouTube"
-    return Path.home() / "Music" / "Playlists YouTube"
+            return Path.home() / nome / sub
+    return Path.home() / nomes[-1 if tipo == "video" else 1] / sub
 
 
-def limpar_nome(nome):
-    return re.sub(r'[\\/:*?"<>|]', "_", nome).strip() or "Playlist"
+_RESERVADOS = {"CON", "PRN", "AUX", "NUL",
+               *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def limpar_nome(nome, padrao="Playlist"):
+    """Deixa o nome seguro para virar pasta no Linux, Windows e macOS."""
+    nome = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", nome or "")
+    nome = re.sub(r"\s+", " ", nome).strip()
+    nome = nome[:150].rstrip(". ")          # Windows não aceita ponto/espaço no fim
+    if not nome:
+        return padrao
+    if nome.split(".")[0].strip().upper() in _RESERVADOS:
+        nome = "_" + nome
+    return nome
+
+
+_HOSTS_YT = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+
+def link_do_youtube(texto):
+    """Devolve o link pronto para usar, ou None se não for do YouTube."""
+    url = texto.strip()
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return None
+    if any(host == h or host.endswith("." + h) for h in _HOSTS_YT):
+        return url
+    return None
+
+
+def rotulo_qualidade(altura):
+    return f"{altura}p" if altura else "Melhor qualidade"
+
+
+def contar(n, t):
+    return f"{n} {t['item'] if n == 1 else t['itens']}"
 
 
 def encurtar(caminho):
@@ -126,6 +220,19 @@ def abrir_pasta(caminho):
 def repolir(w):
     w.style().unpolish(w)
     w.style().polish(w)
+
+
+def esmaecer(w, de, ate, duracao, ao_fim=None, dono=None):
+    """Anima a opacidade de um widget; remove o efeito ao terminar."""
+    efeito = QGraphicsOpacityEffect(w)
+    w.setGraphicsEffect(efeito)
+    anim = QPropertyAnimation(efeito, b"opacity", dono or w)
+    anim.setDuration(duracao)
+    anim.setStartValue(de)
+    anim.setEndValue(ate)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.finished.connect(ao_fim or (lambda: w.setGraphicsEffect(None)))
+    return anim
 
 
 # ----------------------------------------------------------------------------
@@ -221,6 +328,23 @@ QLabel#atual {{ color: {c['texto2']}; font-size: 13px; }}
 
 QScrollArea, QWidget#listaInterna, QWidget#caixaProg {{ background: transparent; border: none; }}
 
+QFrame#abas {{ background: {c['painel']}; border: 1px solid {c['borda']}; border-radius: 12px; }}
+QPushButton#aba {{
+    background: transparent; color: {c['suave']}; border: none; border-radius: 9px;
+    padding: 6px 16px; font-size: 13px; font-weight: 600;
+}}
+QPushButton#aba:hover {{ color: {c['texto']}; }}
+QPushButton#aba:checked {{ background: {c['acento']}; color: {c['sobre_acento']}; }}
+
+QFrame#segmento {{ background: {c['campo']}; border: 1px solid {c['borda']}; border-radius: 10px; }}
+QPushButton#opcao {{
+    background: transparent; color: {c['texto2']}; border: none; border-radius: 7px;
+    padding: 6px 4px; font-size: 13px;
+}}
+QPushButton#opcao:hover {{ color: {c['destaque']}; }}
+QPushButton#opcao:checked {{ background: {c['tag']}; color: {c['tag_txt']}; font-weight: 700; }}
+QPushButton#opcao:disabled {{ color: {c['fraco']}; }}
+
 QLineEdit {{
     background: {c['campo']}; border: 1px solid {c['borda']}; border-radius: 10px;
     padding: 13px 14px; font-size: 14px; selection-background-color: {c['acento']};
@@ -306,17 +430,20 @@ QToolTip {{ background: {c['painel']}; color: {c['texto']}; border: 1px solid {c
 # ----------------------------------------------------------------------------
 class Baixador(QThread):
     info = Signal(str, list)
-    musica_inicio = Signal(int)
-    musica_progresso = Signal(int, float)
-    musica_fim = Signal(int, str)       # "ok" | "existe" | "erro"
+    item_inicio = Signal(int)
+    item_progresso = Signal(int, float)
+    item_etapa = Signal(int, str)
+    item_fim = Signal(int, str)        # "ok" | "existe" | "erro"
     concluido = Signal(dict)
     falhou = Signal(str)
     cancelado = Signal()
 
-    def __init__(self, url, pasta_base):
+    def __init__(self, url, pasta_base, tipo="audio", qualidade=0):
         super().__init__()
         self.url = url
         self.pasta_base = Path(pasta_base)
+        self.tipo = tipo
+        self.qualidade = qualidade
         self._cancelar = False
 
     def cancelar(self):
@@ -328,85 +455,183 @@ class Baixador(QThread):
                                    "no_warnings": True}) as ydl:
                 dados = ydl.extract_info(self.url, download=False)
         except Exception as e:
-            self.falhou.emit(f"Não foi possível ler a playlist.\n\n{e}")
+            if self._cancelar:
+                self.cancelado.emit()
+            else:
+                self.falhou.emit(f"Não foi possível ler o link.\n\n{e}")
+            return
+        if self._cancelar:
+            self.cancelado.emit()
             return
 
-        entradas = [e for e in (dados.get("entries") or []) if e]
-        if not entradas and dados.get("_type", "video") == "video":
-            entradas = [dados]
+        eh_playlist = dados.get("_type") == "playlist" or "entries" in dados
+        entradas = [e for e in (dados.get("entries") or []) if e] if eh_playlist else [dados]
         if not entradas:
-            self.falhou.emit("Nenhuma música encontrada. Confira se a playlist "
+            self.falhou.emit("Nada encontrado nesse link. Confira se a playlist "
                              "está como Pública ou Não listada.")
             return
 
-        nome = dados.get("title") or "Playlist"
-        pasta = self.pasta_base / limpar_nome(nome)
-        pasta.mkdir(parents=True, exist_ok=True)
+        nome = dados.get("title") or ("Playlist" if eh_playlist else "Sem título")
+        # playlist ganha uma pasta própria; item avulso vai direto na pasta escolhida
+        pasta = self.pasta_base / limpar_nome(nome) if eh_playlist else self.pasta_base
+        try:
+            pasta.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.falhou.emit(f"Não foi possível criar a pasta:\n{pasta}\n\n{e}")
+            return
+        numeros = self._numerar(pasta, entradas) if eh_playlist else [None] * len(entradas)
         self.info.emit(nome, [e.get("title") or e.get("id") or "Sem título" for e in entradas])
 
-        presentes = 0
+        presentes = falhas = 0
         for i, entrada in enumerate(entradas):
             if self._cancelar:
                 break
-            self.musica_inicio.emit(i)
-            url_video = (entrada.get("webpage_url") or entrada.get("url")
-                         or f"https://www.youtube.com/watch?v={entrada.get('id')}")
-
-            def gancho(d, i=i):
-                if self._cancelar:
-                    raise DownloadCancelled()
-                if d.get("status") == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                    if total:
-                        self.musica_progresso.emit(i, d.get("downloaded_bytes", 0) / total * 100)
-
-            opcoes = {
-                "format": "bestaudio/best",
-                "outtmpl": str(pasta / f"{i + 1:02d} - %(title)s.%(ext)s"),
-                "postprocessors": [
-                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                     "preferredquality": "192"},
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail"},
-                ],
-                "writethumbnail": True,
-                "download_archive": str(pasta / ".baixados.txt"),
-                "progress_hooks": [gancho],
-                "quiet": True,
-                "no_warnings": True,
-                "noprogress": True,
-            }
-            if FFMPEG_DIR:
-                opcoes["ffmpeg_location"] = FFMPEG_DIR
-
+            self.item_inicio.emit(i)
+            url_item = (entrada.get("webpage_url") or entrada.get("url")
+                        or f"https://www.youtube.com/watch?v={entrada.get('id')}")
             try:
-                with yt_dlp.YoutubeDL(opcoes) as ydl:
+                with yt_dlp.YoutubeDL(self._opcoes(pasta, numeros[i], i)) as ydl:
                     try:
                         ja_tem = ydl.in_download_archive(entrada)
                     except Exception:
                         ja_tem = False
                     if ja_tem:
                         presentes += 1
-                        self.musica_fim.emit(i, "existe")
+                        self.item_fim.emit(i, "existe")
                         continue
-                    ydl.download([url_video])
+                    ydl.download([url_item])
                 presentes += 1
-                self.musica_fim.emit(i, "ok")
+                self.item_fim.emit(i, "ok")
             except DownloadCancelled:
                 break
             except Exception:
                 if self._cancelar:
                     break
-                self.musica_fim.emit(i, "erro")
+                falhas += 1
+                self.item_fim.emit(i, "erro")
 
         if self._cancelar:
             self.cancelado.emit()
             return
+        if presentes == 0:
+            if eh_playlist:
+                self._remover_pasta_vazia(pasta)
+            self.falhou.emit(TEXTOS[self.tipo]["nenhum"])
+            return
 
         self.concluido.emit({
             "nome": nome, "pasta": str(pasta), "total": len(entradas), "ok": presentes,
+            "falhas": falhas, "id": dados.get("id"), "tipo": self.tipo,
+            "qualidade": self.qualidade if self.tipo == "video" else None,
             "data": datetime.now().isoformat(timespec="minutes"), "url": self.url,
         })
+
+    # ---- numeração estável: cada vídeo guarda o número que recebeu na 1ª vez
+    @staticmethod
+    def _numerar(pasta, entradas):
+        arq = pasta / ".ordem.json"
+        mapa = ler_json(arq, {})
+        if not isinstance(mapa, dict):
+            mapa = {}
+        mapa = {k: v for k, v in mapa.items() if isinstance(v, int)}
+        primeira_vez = not mapa   # pastas antigas: mantém a ordem atual da playlist
+        proximo = max(mapa.values(), default=0) + 1
+        numeros = []
+        for i, e in enumerate(entradas):
+            vid = e.get("id")
+            if vid in mapa:
+                n = mapa[vid]
+            else:
+                n = i + 1 if primeira_vez else proximo
+                if vid:
+                    mapa[vid] = n
+            proximo = max(proximo, n + 1)
+            numeros.append(n)
+        try:
+            arq.write_text(json.dumps(mapa), encoding="utf-8")
+        except OSError:
+            pass
+        return numeros
+
+    @staticmethod
+    def _remover_pasta_vazia(pasta):
+        try:
+            if all(p.name == ".ordem.json" for p in pasta.iterdir()):
+                (pasta / ".ordem.json").unlink(missing_ok=True)
+                pasta.rmdir()
+        except OSError:
+            pass
+
+    def _opcoes(self, pasta, numero, i):
+        partes = {}
+
+        def progresso(d):
+            if self._cancelar:
+                raise DownloadCancelled()
+            if d.get("status") != "downloading":
+                return
+            feito = d.get("downloaded_bytes") or 0
+            formatos = (d.get("info_dict") or {}).get("requested_formats") or ()
+            tamanhos = [f.get("filesize") or f.get("filesize_approx") for f in formatos]
+            if len(tamanhos) > 1 and all(tamanhos):
+                # vídeo e áudio separados: soma os dois numa barra só
+                partes[d.get("filename")] = feito
+                pct = sum(partes.values()) / sum(tamanhos) * 100
+            else:
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                if not total:
+                    return
+                pct = feito / total * 100
+            self.item_progresso.emit(i, min(pct, 100.0))
+
+        def etapa(d):
+            if d.get("status") == "started" and d.get("postprocessor") in ETAPAS:
+                self.item_etapa.emit(i, ETAPAS[d["postprocessor"]])
+
+        prefixo = f"{numero:02d} - " if numero else ""
+        opcoes = {
+            # a pasta vai em "paths" para que um "%" no nome dela não quebre o modelo
+            "paths": {"home": str(pasta)},
+            "writethumbnail": True,
+            "progress_hooks": [progresso],
+            "postprocessor_hooks": [etapa],
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+        }
+        if self.tipo == "video":
+            q = self.qualidade
+            opcoes.update({
+                "format": "bv*+ba/b",
+                # a maior resolução até q (ou a mais próxima); nessa resolução, prefere
+                # H.264 + AAC, que abre em qualquer player/TV
+                "format_sort": [f"res:{q}" if q else "res", "fps",
+                                "vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
+                "merge_output_format": "mp4",
+                "outtmpl": prefixo + "%(title)s [%(height)sp].%(ext)s",
+                "download_archive": str(pasta / f".baixados-video-{q or 'melhor'}.txt"),
+                "postprocessors": [
+                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail"},
+                ],
+            })
+        else:
+            opcoes.update({
+                "format": "bestaudio/best",
+                "outtmpl": prefixo + "%(title)s.%(ext)s",
+                "download_archive": str(pasta / ".baixados.txt"),
+                "postprocessors": [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                     "preferredquality": "192"},
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail"},
+                ],
+            })
+        if FFMPEG_DIR:
+            opcoes["ffmpeg_location"] = FFMPEG_DIR
+        return opcoes
 
 
 # ----------------------------------------------------------------------------
@@ -449,8 +674,45 @@ class Tag(QLabel):
             self.clicked.emit()
 
 
+class Segmentado(QFrame):
+    """Fileira de botões em que só um fica marcado (abas, qualidade...)."""
+    escolhido = Signal(int)
+
+    def __init__(self, opcoes, nome_frame, nome_botao, esticar=False):
+        super().__init__()
+        self.setObjectName(nome_frame)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        self.grupo = QButtonGroup(self)
+        self.textos = {}
+        for ident, texto in opcoes:
+            b = QPushButton(texto)
+            b.setObjectName(nome_botao)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            self.grupo.addButton(b, ident)
+            self.textos[ident] = texto
+            lay.addWidget(b, 1 if esticar else 0)
+        self.grupo.idClicked.connect(self.escolhido)
+
+    def selecionar(self, ident):
+        b = self.grupo.button(ident)
+        if b:
+            b.setChecked(True)
+
+    def marcado(self):
+        return self.grupo.checkedId()
+
+    def marcar_ocupado(self, ident, sim):
+        b = self.grupo.button(ident)
+        if b:
+            b.setText(self.textos[ident] + ("  •" if sim else ""))
+            b.setToolTip("Baixando…" if sim else "")
+
+
 class CartaoHistorico(QFrame):
-    def __init__(self, reg, ultima=False):
+    def __init__(self, reg, textos, ultima=False):
         super().__init__()
         self.setObjectName("cartao")
         lay = QVBoxLayout(self)
@@ -468,12 +730,20 @@ class CartaoHistorico(QFrame):
         topo.addWidget(self.selo, 0, Qt.AlignTop)
         lay.addLayout(topo)
 
+        partes = []
+        if reg.get("tipo") == "video":
+            partes.append(rotulo_qualidade(reg.get("qualidade")))
+        partes.append(f"{reg.get('ok', 0)} de {contar(reg.get('total', 0), textos)}")
+        if reg.get("falhas"):
+            partes.append(f"{reg['falhas']} com erro")
+        texto = " · ".join(partes)
         try:
-            quando = datetime.fromisoformat(reg["data"]).strftime("%d/%m/%Y às %H:%M")
+            texto += datetime.fromisoformat(reg["data"]).strftime(", em %d/%m/%Y às %H:%M")
         except Exception:
-            quando = ""
-        info = QLabel(f"{reg.get('ok', 0)} de {reg.get('total', 0)} músicas, em {quando}")
+            pass
+        info = QLabel(texto)
         info.setObjectName("cartaoInfo")
+        info.setWordWrap(True)
         lay.addWidget(info)
 
         tag = Tag(encurtar(reg["pasta"]))
@@ -541,16 +811,8 @@ class Divisoria(QSplitter):
         self.insertWidget(1, self.widget(0))
         self.setSizes(tamanhos[::-1])
         for i in range(self.count()):  # transição suave
-            w = self.widget(i)
-            efeito = QGraphicsOpacityEffect(w)
-            w.setGraphicsEffect(efeito)
-            anim = QPropertyAnimation(efeito, b"opacity", self)
-            anim.setDuration(320)
-            anim.setStartValue(0.25)
-            anim.setEndValue(1.0)
-            anim.setEasingCurve(QEasingCurve.OutCubic)
-            anim.finished.connect(lambda w=w: w.setGraphicsEffect(None))
-            anim.start(QAbstractAnimation.DeleteWhenStopped)
+            esmaecer(self.widget(i), 0.25, 1.0, 320, dono=self).start(
+                QAbstractAnimation.DeleteWhenStopped)
         self.trocou.emit()
 
 
@@ -712,93 +974,56 @@ class SeletorCor(QWidget):
 
 
 # ----------------------------------------------------------------------------
-# Janela principal
+# Uma aba (Música ou Vídeo): histórico + painel de baixar
 # ----------------------------------------------------------------------------
 ICONES = {"pendente": "○", "baixando": "↓", "ok": "✓", "existe": "↷", "erro": "✕"}
 
 
-class Janela(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("raiz")
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setWindowTitle("SomDeMala")
-        self.resize(1140, 720)
-        self.setMinimumSize(800, 560)
+def mesmo_download(a, b):
+    if a.get("tipo", "audio") != b.get("tipo", "audio"):
+        return False
+    if a.get("tipo") == "video" and a.get("qualidade") != b.get("qualidade"):
+        return False
+    if a.get("id") and b.get("id"):
+        return a["id"] == b["id"]
+    return a.get("pasta") == b.get("pasta")   # registros antigos, sem id
 
-        self.historico = ler_json(ARQ_HIST, [])
-        self.conf = ler_json(ARQ_CONF, {})
-        self.pasta_base = self.conf.get("pasta_base") or str(pasta_musica_padrao())
-        self.cor = self.conf.get("cor")
-        self.tema = self.conf.get("tema", "escuro")
+
+class Pagina(QWidget):
+    ocupado = Signal(bool)
+
+    def __init__(self, janela, tipo, arq_hist, pasta_base, qualidade=QUALIDADE_PADRAO):
+        super().__init__()
+        self.janela = janela
+        self.tipo = tipo
+        self.t = TEXTOS[tipo]
+        self.arq_hist = arq_hist
+        self.pasta_base = pasta_base
+        self.qualidade = qualidade if qualidade in dict(QUALIDADES) else QUALIDADE_PADRAO
+        hist = ler_json(arq_hist, [])
+        self.historico = [r for r in hist if isinstance(r, dict) and r.get("nome")
+                          and r.get("pasta")] if isinstance(hist, list) else []
         self.worker = None
+        self._orfaos = []     # downloads cancelados que ainda estão encerrando
+        self._lendo = False
+        self._prop = 0.5
         self.cartoes = []
         self.titulos = []
         self.estados = []
         self.feitos = 0
 
-        raiz = QVBoxLayout(self)
-        raiz.setContentsMargins(20, 14, 20, 20)
-        raiz.setSpacing(12)
-        raiz.addLayout(self._montar_topo())
-
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         self.painel_hist = self._montar_historico()
         self.painel_baixar = self._montar_baixar()
         self.divisoria = Divisoria()
-        if self.conf.get("ordem") == "hist-dir":
-            self.divisoria.addWidget(self.painel_baixar)
-            self.divisoria.addWidget(self.painel_hist)
-        else:
-            self.divisoria.addWidget(self.painel_hist)
-            self.divisoria.addWidget(self.painel_baixar)
-        self._aplicar_proporcao(self.conf.get("proporcao", 0.5))
-        self.divisoria.splitterMoved.connect(lambda *_: self._timer_salvar.start())
-        self.divisoria.trocou.connect(self.salvar_conf)
-        raiz.addWidget(self.divisoria, 1)
-
-        self._timer_salvar = QTimer(self, singleShot=True, interval=400)
-        self._timer_salvar.timeout.connect(self.salvar_conf)
-
-        self.seletor = SeletorCor(self)
-        self.seletor.cor_escolhida.connect(self._cor_ao_vivo)
-        self.seletor.fechou.connect(self.salvar_conf)
-        self._cor_pendente = None
-        self._timer_cor = QTimer(self, singleShot=True, interval=30)
-        self._timer_cor.timeout.connect(self._aplicar_cor_pendente)
+        self.divisoria.addWidget(self.painel_hist)
+        self.divisoria.addWidget(self.painel_baixar)
+        lay.addWidget(self.divisoria)
 
         for i, reg in enumerate(self.historico):
             self._inserir_cartao(reg, ultima=(i == 0), no_topo=False)
         self._atualizar_contagem()
-        self.aplicar_tema()
-
-        if not FFMPEG_DIR and not shutil.which("ffmpeg"):
-            QTimer.singleShot(400, lambda: QMessageBox.warning(
-                self, "FFmpeg não encontrado",
-                "O FFmpeg é necessário para converter as músicas em MP3.\n\n"
-                "No Ubuntu, instale com: sudo apt install ffmpeg"))
-
-    # ---- topo: cor e tema --------------------------------------------------
-    def _montar_topo(self):
-        topo = QHBoxLayout()
-        topo.setSpacing(10)
-        marca = QLabel("SomDeMala")
-        marca.setObjectName("marca")
-        topo.addWidget(marca)
-        topo.addStretch(1)
-
-        self.btn_cor = QPushButton()
-        self.btn_cor.setObjectName("amostra")
-        self.btn_cor.setCursor(Qt.PointingHandCursor)
-        self.btn_cor.setToolTip("Escolher a cor principal")
-        self.btn_cor.clicked.connect(lambda: self.seletor.abrir(self.cor, self.btn_cor))
-        topo.addWidget(self.btn_cor)
-
-        self.btn_tema = QPushButton()
-        self.btn_tema.setObjectName("iconeTema")
-        self.btn_tema.setCursor(Qt.PointingHandCursor)
-        self.btn_tema.clicked.connect(self.alternar_tema)
-        topo.addWidget(self.btn_tema)
-        return topo
 
     def _novo_painel(self):
         painel = QFrame()
@@ -822,7 +1047,7 @@ class Janela(QWidget):
         self.btn_limpar = QPushButton("Limpar histórico")
         self.btn_limpar.setObjectName("secundario")
         self.btn_limpar.setCursor(Qt.PointingHandCursor)
-        self.btn_limpar.setToolTip("Limpa só a lista. As músicas baixadas continuam nas pastas.")
+        self.btn_limpar.setToolTip(f"Limpa só a lista. Os arquivos baixados continuam nas pastas.")
         self.btn_limpar.clicked.connect(self.limpar_historico)
         cabecalho.addWidget(self.btn_limpar, 0, Qt.AlignVCenter)
         lay.addLayout(cabecalho)
@@ -844,8 +1069,7 @@ class Janela(QWidget):
         self.lista_hist.setContentsMargins(0, 0, 6, 0)
         self.lista_hist.setSpacing(10)
 
-        self.vazio = QLabel("Nenhuma playlist baixada ainda.\n"
-                            "As playlists que você baixar vão aparecer aqui.")
+        self.vazio = QLabel(self.t["vazio"])
         self.vazio.setObjectName("vazio")
         self.vazio.setAlignment(Qt.AlignCenter)
         self.lista_hist.addWidget(self.vazio)
@@ -862,17 +1086,17 @@ class Janela(QWidget):
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setSpacing(4)
 
-        titulo = QLabel("Baixar playlist")
+        titulo = QLabel(self.t["titulo"])
         titulo.setObjectName("titulo")
         lay.addWidget(titulo)
-        sub = QLabel("")
+        sub = QLabel(self.t["sub"])
         sub.setObjectName("sub")
         sub.setWordWrap(True)
         lay.addWidget(sub)
         lay.addSpacing(18)
 
         self.campo = QLineEdit()
-        self.campo.setPlaceholderText("Cole aqui o link da playlist do YouTube")
+        self.campo.setPlaceholderText(self.t["placeholder"])
         self.campo.returnPressed.connect(self.iniciar)
         lay.addWidget(self.campo)
         lay.addSpacing(10)
@@ -891,6 +1115,20 @@ class Janela(QWidget):
         self.btn_pasta.clicked.connect(self.escolher_pasta)
         linha.addWidget(self.btn_pasta)
         lay.addLayout(linha)
+
+        self.seletor_q = None
+        if self.tipo == "video":
+            lay.addSpacing(12)
+            rot_q = QLabel("Qualidade")
+            rot_q.setObjectName("sub")
+            lay.addWidget(rot_q)
+            lay.addSpacing(4)
+            self.seletor_q = Segmentado(QUALIDADES, "segmento", "opcao", esticar=True)
+            self.seletor_q.setToolTip("Se o vídeo não tiver essa qualidade, "
+                                      "baixa a mais próxima abaixo dela.")
+            self.seletor_q.selecionar(self.qualidade)
+            self.seletor_q.escolhido.connect(self._mudou_qualidade)
+            lay.addWidget(self.seletor_q)
         lay.addSpacing(14)
 
         self.btn_baixar = QPushButton("Baixar")
@@ -900,8 +1138,7 @@ class Janela(QWidget):
         lay.addWidget(self.btn_baixar)
         lay.addSpacing(22)
 
-        self.ocioso = QLabel("Cole um link acima e clique em Baixar.\n"
-                             "O progresso de cada música aparece aqui.")
+        self.ocioso = QLabel(self.t["ocioso"])
         self.ocioso.setObjectName("vazio")
         self.ocioso.setAlignment(Qt.AlignCenter)
         self.ocioso.setWordWrap(True)
@@ -935,10 +1172,10 @@ class Janela(QWidget):
         cp.addWidget(self.barra_atual)
         cp.addSpacing(6)
 
-        self.lista_musicas = QListWidget()
-        self.lista_musicas.setFocusPolicy(Qt.NoFocus)
-        self.lista_musicas.setSelectionMode(QListWidget.NoSelection)
-        cp.addWidget(self.lista_musicas, 1)
+        self.lista_itens = QListWidget()
+        self.lista_itens.setFocusPolicy(Qt.NoFocus)
+        self.lista_itens.setSelectionMode(QListWidget.NoSelection)
+        cp.addWidget(self.lista_itens, 1)
 
         self.btn_cancelar = QPushButton("Cancelar download")
         self.btn_cancelar.setObjectName("secundario")
@@ -951,55 +1188,35 @@ class Janela(QWidget):
         return painel
 
     # ---- layout: proporção e ordem ----------------------------------------
-    def _aplicar_proporcao(self, prop):
-        prop = min(max(float(prop), 0.2), 0.8)
-        a, b = int(prop * 1000), int((1 - prop) * 1000)
-        hist_primeiro = self.divisoria.widget(0) is self.painel_hist
-        self.divisoria.setSizes([a, b] if hist_primeiro else [b, a])
-
-    def salvar_conf(self):
+    def layout_atual(self):
         tamanhos = self.divisoria.sizes()
-        total = sum(tamanhos) or 1
         i_hist = self.divisoria.indexOf(self.painel_hist)
-        self.conf.update({
-            "pasta_base": self.pasta_base,
-            "cor": self.cor,
-            "tema": self.tema,
-            "ordem": "hist-esq" if i_hist == 0 else "hist-dir",
-            "proporcao": round(tamanhos[i_hist] / total, 3),
-        })
-        gravar_json(ARQ_CONF, self.conf)
+        total = sum(tamanhos)
+        prop = round(tamanhos[i_hist] / total, 3) if total else self._prop
+        return i_hist == 0, prop
 
-    # ---- cor e tema --------------------------------------------------------
-    def aplicar_tema(self):
-        self.paleta = montar_paleta(self.cor, self.tema)
-        QApplication.instance().setStyleSheet(montar_estilo(self.paleta))
-        self.divisoria.cor_grip = self.paleta["suave"]
+    def definir_layout(self, hist_esq, prop):
+        if (self.divisoria.indexOf(self.painel_hist) == 0) != hist_esq:
+            self.divisoria.insertWidget(1, self.divisoria.widget(0))
+        try:
+            prop = min(max(float(prop), 0.2), 0.8)
+        except (TypeError, ValueError):
+            prop = 0.5
+        self._prop = prop
+        a, b = int(prop * 1000), int((1 - prop) * 1000)
+        self.divisoria.setSizes([a, b] if hist_esq else [b, a])
+
+    def recolorir(self, paleta):
+        self.divisoria.cor_grip = paleta["suave"]
         for i in range(self.divisoria.count()):
             self.divisoria.handle(i).update()
-        escuro = self.tema == "escuro"
-        self.btn_tema.setText("☀" if escuro else "☾")
-        self.btn_tema.setToolTip("Mudar para o modo claro" if escuro else "Mudar para o modo escuro")
         for i, estado in enumerate(self.estados):
             self._marcar(i, estado)
-
-    def alternar_tema(self):
-        self.tema = "claro" if self.tema == "escuro" else "escuro"
-        self.aplicar_tema()
-        self.salvar_conf()
-
-    def _cor_ao_vivo(self, cor):
-        self._cor_pendente = cor
-        self._timer_cor.start()   # evita redesenhar a cada pixel arrastado
-
-    def _aplicar_cor_pendente(self):
-        self.cor = self._cor_pendente
-        self.aplicar_tema()
 
     # ---- histórico ---------------------------------------------------------
     def _inserir_cartao(self, reg, ultima, no_topo=True):
         self.vazio.hide()
-        cartao = CartaoHistorico(reg, ultima=ultima)
+        cartao = CartaoHistorico(reg, self.t, ultima=ultima)
         if no_topo:
             for c in self.cartoes:
                 c.marcar_ultima(False)
@@ -1010,19 +1227,29 @@ class Janela(QWidget):
             self.cartoes.append(cartao)
         return cartao
 
+    def _remover_repetidos(self, reg):
+        """Baixar de novo o mesmo link substitui o registro antigo."""
+        for idx in reversed(range(len(self.historico))):
+            if mesmo_download(self.historico[idx], reg):
+                del self.historico[idx]
+                if idx < len(self.cartoes):
+                    cartao = self.cartoes.pop(idx)
+                    self.lista_hist.removeWidget(cartao)
+                    cartao.deleteLater()
+
     def limpar_historico(self):
         if not self.cartoes:
             return
         resp = QMessageBox.question(
             self, "Limpar histórico",
-            "Limpar a lista de playlists baixadas?\n\n"
-            "As músicas continuam salvas nas pastas do seu computador.",
+            "Limpar a lista de downloads?\n\n"
+            "Os arquivos continuam salvos nas pastas do seu computador.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if resp != QMessageBox.Yes:
             return
 
         self.historico = []
-        gravar_json(ARQ_HIST, self.historico)
+        gravar_json(self.arq_hist, self.historico)
         cartoes, self.cartoes = self.cartoes, []
         self.btn_limpar.setEnabled(False)
 
@@ -1030,17 +1257,13 @@ class Janela(QWidget):
             for c in cartoes:
                 self.lista_hist.removeWidget(c)
                 c.deleteLater()
-            self.vazio.show()
+            if not self.cartoes:
+                self.vazio.show()
             self._atualizar_contagem()
 
         # os cartões somem em sequência, de cima para baixo
         for i, c in enumerate(cartoes):
-            efeito = QGraphicsOpacityEffect(c)
-            c.setGraphicsEffect(efeito)
-            anim = QPropertyAnimation(efeito, b"opacity", self)
-            anim.setDuration(260)
-            anim.setStartValue(1.0)
-            anim.setEndValue(0.0)
+            anim = esmaecer(c, 1.0, 0.0, 260, ao_fim=lambda: None, dono=self)
             QTimer.singleShot(min(i, 8) * 45,
                               lambda a=anim: a.start(QAbstractAnimation.DeleteWhenStopped))
         QTimer.singleShot(min(len(cartoes) - 1, 8) * 45 + 300, remover)
@@ -1048,9 +1271,8 @@ class Janela(QWidget):
     def _atualizar_contagem(self):
         n = len(self.historico)
         self.btn_limpar.setEnabled(n > 0)
-        self.lbl_contagem.setText("Nenhuma playlist ainda" if n == 0 else
-                                  f"{n} playlist baixada" if n == 1 else
-                                  f"{n} playlists baixadas")
+        self.lbl_contagem.setText("Nenhum download ainda" if n == 0 else
+                                  "1 download" if n == 1 else f"{n} downloads")
 
     # ---- ações -------------------------------------------------------------
     def escolher_pasta(self):
@@ -1058,62 +1280,109 @@ class Janela(QWidget):
         if pasta:
             self.pasta_base = pasta
             self.tag_pasta.definir(encurtar(pasta))
-            self.salvar_conf()
+            self.janela.salvar_conf()
+
+    def _mudou_qualidade(self, altura):
+        self.qualidade = altura
+        self.janela.salvar_conf()
+
+    def _travar(self, sim):
+        self.campo.setEnabled(not sim)
+        self.btn_baixar.setEnabled(not sim)
+        self.btn_pasta.setEnabled(not sim)
+        if self.seletor_q:
+            self.seletor_q.setEnabled(not sim)
 
     def iniciar(self):
-        url = self.campo.text().strip()
-        if not url:
+        texto = self.campo.text().strip()
+        if not texto:
             self.campo.setFocus()
             return
-        if "youtube.com" not in url and "youtu.be" not in url:
+        url = link_do_youtube(texto)
+        if not url:
             QMessageBox.warning(self, "Link inválido",
-                                "Esse link não parece ser do YouTube. Cole o link da playlist.")
+                                "Esse link não parece ser do YouTube. "
+                                "Cole o link de um vídeo ou de uma playlist.")
             return
+        if self.worker and self.worker.isRunning():
+            self._soltar(self.worker)
 
-        self.campo.setEnabled(False)
-        self.btn_baixar.setEnabled(False)
-        self.btn_pasta.setEnabled(False)
+        self._travar(True)
         self.btn_cancelar.setEnabled(True)
         self.ocioso.hide()
+        self.caixa_prog.setGraphicsEffect(None)
         self.caixa_prog.show()
-        self.lbl_playlist.setText("Lendo a playlist…")
+        self.lbl_playlist.setText("Lendo o link…")
         self.lbl_geral.setText("")
         self.lbl_atual.setText("")
         self.barra_geral.setRange(0, 0)
         self.barra_atual.setValue(0)
-        self.lista_musicas.clear()
+        self.lista_itens.clear()
+        self.titulos = []
         self.estados = []
         self.feitos = 0
+        self._lendo = True
 
-        self.worker = Baixador(url, self.pasta_base)
-        self.worker.info.connect(self.ao_receber_info)
-        self.worker.musica_inicio.connect(self.ao_iniciar_musica)
-        self.worker.musica_progresso.connect(lambda i, p: self.barra_atual.setValue(int(p)))
-        self.worker.musica_fim.connect(self.ao_terminar_musica)
-        self.worker.concluido.connect(self.ao_concluir)
-        self.worker.falhou.connect(self.ao_falhar)
-        self.worker.cancelado.connect(lambda: self.resetar_baixar(animado=True))
-        self.worker.start()
+        w = Baixador(url, self.pasta_base, self.tipo, self.qualidade)
+        w.info.connect(self.ao_receber_info)
+        w.item_inicio.connect(self.ao_iniciar_item)
+        w.item_progresso.connect(self.ao_progredir)
+        w.item_etapa.connect(self.ao_mudar_etapa)
+        w.item_fim.connect(self.ao_terminar_item)
+        w.concluido.connect(self.ao_concluir)
+        w.falhou.connect(self.ao_falhar)
+        w.cancelado.connect(self.ao_cancelar)
+        self.worker = w
+        w.start()
+        self.ocupado.emit(True)
+
+    def _do_atual(self):
+        """Ignora sinais de downloads que já foram cancelados/descartados."""
+        return self.worker is not None and self.sender() is self.worker
+
+    def _soltar(self, w):
+        """Deixa o download terminar sozinho em segundo plano, sem mexer na tela."""
+        w.cancelar()
+        self._orfaos.append(w)
+        w.finished.connect(self._orfao_terminou)
+        if w is self.worker:
+            self.worker = None
+
+    def _orfao_terminou(self):
+        w = self.sender()
+        if w in self._orfaos:
+            w.wait()
+            self._orfaos.remove(w)
 
     def cancelar(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.cancelar()
-            self.btn_cancelar.setEnabled(False)
+        w = self.worker
+        if not (w and w.isRunning()):
+            return
+        self.btn_cancelar.setEnabled(False)
+        if self._lendo:
+            # a leitura do link não pode ser interrompida: libera a tela na hora
+            self._soltar(w)
+            self.resetar_baixar(animado=True)
+        else:
+            w.cancelar()
             self.lbl_atual.setText("Cancelando…")
 
     def ao_receber_info(self, nome, titulos):
+        if not self._do_atual():
+            return
+        self._lendo = False
         self.titulos = titulos
         self.estados = ["pendente"] * len(titulos)
         self.lbl_playlist.setText(nome)
         self.barra_geral.setRange(0, len(titulos))
         self.barra_geral.setValue(0)
-        self.lbl_geral.setText(f"0 de {len(titulos)} músicas")
+        self.lbl_geral.setText(f"0 de {contar(len(titulos), self.t)}")
         for i in range(len(titulos)):
-            self.lista_musicas.addItem(QListWidgetItem())
+            self.lista_itens.addItem(QListWidgetItem())
             self._marcar(i, "pendente")
 
     def _marcar(self, i, estado):
-        item = self.lista_musicas.item(i)
+        item = self.lista_itens.item(i)
         if not item:
             return
         self.estados[i] = estado
@@ -1122,33 +1391,55 @@ class Janela(QWidget):
         item.setText(f"{ICONES[estado]}   {i + 1:02d}   {self.titulos[i]}{extra}")
         cores = {"pendente": "fraco", "baixando": "destaque", "ok": "sucesso",
                  "existe": "fraco", "erro": "erro"}
-        item.setForeground(self.paleta[cores[estado]])
+        item.setForeground(self.janela.paleta[cores[estado]])
 
-    def ao_iniciar_musica(self, i):
+    def ao_iniciar_item(self, i):
+        if not self._do_atual():
+            return
         self._marcar(i, "baixando")
-        self.lista_musicas.scrollToItem(self.lista_musicas.item(i))
+        self.lista_itens.scrollToItem(self.lista_itens.item(i))
         self.lbl_atual.setText(f"Baixando: {self.titulos[i]}")
         self.barra_atual.setValue(0)
 
-    def ao_terminar_musica(self, i, estado):
+    def ao_progredir(self, i, pct):
+        if self._do_atual():
+            self.barra_atual.setValue(int(pct))
+
+    def ao_mudar_etapa(self, i, etapa):
+        if self._do_atual() and i < len(self.titulos):
+            self.barra_atual.setValue(100)
+            self.lbl_atual.setText(f"{etapa}: {self.titulos[i]}")
+
+    def ao_terminar_item(self, i, estado):
+        if not self._do_atual():
+            return
         self._marcar(i, estado)
         self.feitos += 1
         self.barra_geral.setValue(self.feitos)
-        self.lbl_geral.setText(f"{self.feitos} de {len(self.titulos)} músicas")
+        self.lbl_geral.setText(f"{self.feitos} de {contar(len(self.titulos), self.t)}")
         self.barra_atual.setValue(100)
 
+    def ao_cancelar(self):
+        if self._do_atual():
+            self.resetar_baixar(animado=True)
+
     def ao_falhar(self, msg):
-        QMessageBox.warning(self, "Não foi possível baixar", msg)
+        if not self._do_atual():
+            return
         self.resetar_baixar()
+        QMessageBox.warning(self, "Não foi possível baixar", msg)
 
     def ao_concluir(self, reg):
-        self.lbl_atual.setText("Playlist concluída")
+        if not self._do_atual():
+            return
+        self.lbl_atual.setText("Download concluído")
         self.btn_cancelar.setEnabled(False)
+        self._remover_repetidos(reg)
         self.historico.insert(0, reg)
-        gravar_json(ARQ_HIST, self.historico)
+        gravar_json(self.arq_hist, self.historico)
         QTimer.singleShot(500, lambda: self.animar_para_historico(reg))
 
-    # ---- animação: nome da playlist voa para o histórico ------------------
+    # ---- animação: nome do download voa para o histórico -----------------
     def animar_para_historico(self, reg):
         self.scroll.verticalScrollBar().setValue(0)
 
@@ -1180,9 +1471,11 @@ class Janela(QWidget):
         sumir.setEndValue(0.0)
 
         def pousou():
-            cartao = self._inserir_cartao(reg, ultima=True)
+            # se o histórico foi limpo durante o voo, não recria o cartão
+            if any(r is reg for r in self.historico):
+                cartao = self._inserir_cartao(reg, ultima=True)
+                self._destacar(cartao)
             self._atualizar_contagem()
-            self._destacar(cartao)
             self.resetar_baixar(animado=True)
 
         voo.finished.connect(pousou)
@@ -1195,14 +1488,7 @@ class Janela(QWidget):
     def _destacar(self, cartao):
         cartao.setProperty("novo", True)
         repolir(cartao)
-        efeito = QGraphicsOpacityEffect(cartao)
-        cartao.setGraphicsEffect(efeito)
-        entrar = QPropertyAnimation(efeito, b"opacity", self)
-        entrar.setDuration(450)
-        entrar.setStartValue(0.0)
-        entrar.setEndValue(1.0)
-        entrar.finished.connect(lambda: cartao.setGraphicsEffect(None))
-        entrar.start(QAbstractAnimation.DeleteWhenStopped)
+        esmaecer(cartao, 0.0, 1.0, 450, dono=self).start(QAbstractAnimation.DeleteWhenStopped)
 
         def apagar_destaque():
             cartao.setProperty("novo", False)
@@ -1211,38 +1497,187 @@ class Janela(QWidget):
 
     # ---- limpa o painel de baixar para o próximo link ---------------------
     def resetar_baixar(self, animado=False):
+        self._lendo = False
+        self.ocupado.emit(False)
+
         def limpar():
             self.caixa_prog.setGraphicsEffect(None)
             self.caixa_prog.hide()
-            self.lista_musicas.clear()
+            self.lista_itens.clear()
             self.estados = []
             self.barra_geral.setRange(0, 1)
             self.barra_geral.setValue(0)
             self.barra_atual.setValue(0)
             self.campo.clear()
-            self.campo.setEnabled(True)
-            self.btn_baixar.setEnabled(True)
-            self.btn_pasta.setEnabled(True)
+            self._travar(False)
             self.ocioso.show()
             self.campo.setFocus()
 
         if not animado:
             limpar()
             return
-        efeito = QGraphicsOpacityEffect(self.caixa_prog)
-        self.caixa_prog.setGraphicsEffect(efeito)
-        sumir = QPropertyAnimation(efeito, b"opacity", self)
-        sumir.setDuration(450)
-        sumir.setStartValue(1.0)
-        sumir.setEndValue(0.0)
-        sumir.finished.connect(limpar)
-        sumir.start(QAbstractAnimation.DeleteWhenStopped)
+        esmaecer(self.caixa_prog, 1.0, 0.0, 450, ao_fim=limpar, dono=self).start(
+            QAbstractAnimation.DeleteWhenStopped)
+
+    def encerrar(self):
+        for w in [self.worker, *self._orfaos]:
+            if w and w.isRunning():
+                w.cancelar()
+                w.wait(5000)
+
+
+# ----------------------------------------------------------------------------
+# Janela principal
+# ----------------------------------------------------------------------------
+class Janela(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("raiz")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setWindowTitle("SomDeMala")
+        self.resize(1140, 740)
+        self.setMinimumSize(800, 600)
+
+        conf = ler_json(ARQ_CONF, {})
+        self.conf = conf if isinstance(conf, dict) else {}
+        cor = self.conf.get("cor")
+        self.cor = cor if isinstance(cor, str) and QColor(cor).isValid() else None
+        self.tema = "claro" if self.conf.get("tema") == "claro" else "escuro"
+
+        self._timer_salvar = QTimer(self, singleShot=True, interval=400)
+        self._timer_salvar.timeout.connect(self.salvar_conf)
+
+        raiz = QVBoxLayout(self)
+        raiz.setContentsMargins(20, 14, 20, 20)
+        raiz.setSpacing(12)
+        raiz.addLayout(self._montar_topo())
+
+        self.pag_audio = Pagina(self, "audio", ARQ_HIST,
+                                self.conf.get("pasta_base") or str(pasta_padrao("audio")))
+        self.pag_video = Pagina(self, "video", ARQ_HIST_VIDEO,
+                                self.conf.get("pasta_video") or str(pasta_padrao("video")),
+                                qualidade=self.conf.get("qualidade_video", QUALIDADE_PADRAO))
+        self.paginas = [self.pag_audio, self.pag_video]
+
+        self.pilha = QStackedWidget()
+        hist_esq = self.conf.get("ordem") != "hist-dir"
+        for i, pag in enumerate(self.paginas):
+            pag.definir_layout(hist_esq, self.conf.get("proporcao", 0.5))
+            pag.divisoria.splitterMoved.connect(lambda *_: self._timer_salvar.start())
+            pag.divisoria.trocou.connect(self.salvar_conf)
+            pag.ocupado.connect(lambda sim, i=i: self.abas.marcar_ocupado(i, sim))
+            self.pilha.addWidget(pag)
+        raiz.addWidget(self.pilha, 1)
+
+        inicial = 1 if self.conf.get("aba") == "video" else 0
+        self.pilha.setCurrentIndex(inicial)
+        self.abas.selecionar(inicial)
+
+        self.seletor = SeletorCor(self)
+        self.seletor.cor_escolhida.connect(self._cor_ao_vivo)
+        self.seletor.fechou.connect(self.salvar_conf)
+        self._cor_pendente = None
+        self._timer_cor = QTimer(self, singleShot=True, interval=30)
+        self._timer_cor.timeout.connect(self._aplicar_cor_pendente)
+
+        for i in range(len(self.paginas)):
+            QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self, lambda i=i: self.trocar_aba(i))
+        QShortcut(QKeySequence("Ctrl+Tab"), self,
+                  lambda: self.trocar_aba(1 - self.pilha.currentIndex()))
+
+        self.aplicar_tema()
+
+        if not FFMPEG_DIR and not shutil.which("ffmpeg"):
+            QTimer.singleShot(400, lambda: QMessageBox.warning(
+                self, "FFmpeg não encontrado",
+                "O FFmpeg é necessário para converter as músicas e juntar os vídeos.\n\n"
+                "No Ubuntu, instale com: sudo apt install ffmpeg"))
+
+    # ---- topo: abas, cor e tema --------------------------------------------
+    def _montar_topo(self):
+        topo = QHBoxLayout()
+        topo.setSpacing(10)
+        marca = QLabel("SomDeMala")
+        marca.setObjectName("marca")
+        topo.addWidget(marca)
+        topo.addSpacing(10)
+
+        self.abas = Segmentado([(0, TEXTOS["audio"]["aba"]), (1, TEXTOS["video"]["aba"])],
+                               "abas", "aba")
+        self.abas.setToolTip("Ctrl+1 / Ctrl+2 trocam de aba")
+        self.abas.escolhido.connect(self.trocar_aba)
+        topo.addWidget(self.abas)
+        topo.addStretch(1)
+
+        self.btn_cor = QPushButton()
+        self.btn_cor.setObjectName("amostra")
+        self.btn_cor.setCursor(Qt.PointingHandCursor)
+        self.btn_cor.setToolTip("Escolher a cor principal")
+        self.btn_cor.clicked.connect(lambda: self.seletor.abrir(self.cor, self.btn_cor))
+        topo.addWidget(self.btn_cor)
+
+        self.btn_tema = QPushButton()
+        self.btn_tema.setObjectName("iconeTema")
+        self.btn_tema.setCursor(Qt.PointingHandCursor)
+        self.btn_tema.clicked.connect(self.alternar_tema)
+        topo.addWidget(self.btn_tema)
+        return topo
+
+    def trocar_aba(self, i):
+        self.abas.selecionar(i)
+        atual, nova = self.pilha.currentWidget(), self.paginas[i]
+        if nova is atual:
+            return
+        nova.definir_layout(*atual.layout_atual())   # mesma disposição nas duas abas
+        self.pilha.setCurrentWidget(nova)
+        esmaecer(nova, 0.3, 1.0, 260, dono=self).start(QAbstractAnimation.DeleteWhenStopped)
+        self.salvar_conf()
+
+    def salvar_conf(self):
+        pag = self.pilha.currentWidget()
+        hist_esq, prop = pag.layout_atual()
+        self.conf.update({
+            "pasta_base": self.pag_audio.pasta_base,
+            "pasta_video": self.pag_video.pasta_base,
+            "qualidade_video": self.pag_video.qualidade,
+            "cor": self.cor,
+            "tema": self.tema,
+            "aba": pag.tipo,
+            "ordem": "hist-esq" if hist_esq else "hist-dir",
+            "proporcao": prop,
+        })
+        try:
+            gravar_json(ARQ_CONF, self.conf)
+        except OSError:
+            pass
+
+    # ---- cor e tema --------------------------------------------------------
+    def aplicar_tema(self):
+        self.paleta = montar_paleta(self.cor, self.tema)
+        QApplication.instance().setStyleSheet(montar_estilo(self.paleta))
+        for pag in self.paginas:
+            pag.recolorir(self.paleta)
+        escuro = self.tema == "escuro"
+        self.btn_tema.setText("☀" if escuro else "☾")
+        self.btn_tema.setToolTip("Mudar para o modo claro" if escuro else "Mudar para o modo escuro")
+
+    def alternar_tema(self):
+        self.tema = "claro" if self.tema == "escuro" else "escuro"
+        self.aplicar_tema()
+        self.salvar_conf()
+
+    def _cor_ao_vivo(self, cor):
+        self._cor_pendente = cor
+        self._timer_cor.start()   # evita redesenhar a cada pixel arrastado
+
+    def _aplicar_cor_pendente(self):
+        self.cor = self._cor_pendente
+        self.aplicar_tema()
 
     def closeEvent(self, evento):
         self.salvar_conf()
-        if self.worker and self.worker.isRunning():
-            self.worker.cancelar()
-            self.worker.wait(5000)
+        for pag in self.paginas:
+            pag.encerrar()
         super().closeEvent(evento)
 
 

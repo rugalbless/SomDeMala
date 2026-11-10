@@ -11,19 +11,20 @@ PY=.venv-build/bin/python
 $PY -m pip install -q -U pip
 $PY -m pip install -q -U yt-dlp PySide6 pyinstaller
 
-if [ ! -f ffmpeg-bin/ffmpeg ]; then
+if [ ! -f ffmpeg-bin/ffmpeg ] || [ ! -f ffmpeg-bin/ffprobe ]; then
   echo ">> Baixando FFmpeg estático (não depende de nada no sistema)"
-  # Só o ffmpeg é necessário; o ffprobe é opcional e dobraria o tamanho do pacote
+  # ffprobe: o yt-dlp usa para inspecionar os arquivos ao converter e juntar vídeo + áudio
   mkdir -p ffmpeg-bin
   curl -L --fail -o ffmpeg.tar.xz \
     https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-  tar -xf ffmpeg.tar.xz -C ffmpeg-bin --strip-components=2 --wildcards '*/bin/ffmpeg'
+  tar -xf ffmpeg.tar.xz -C ffmpeg-bin --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
   rm ffmpeg.tar.xz
 fi
 
 echo ">> Empacotando"
 $PY -m PyInstaller --noconfirm --clean --windowed --name "$APP" \
   --add-binary "ffmpeg-bin/ffmpeg:." \
+  --add-binary "ffmpeg-bin/ffprobe:." \
   SomDeMala.py
 
 cd dist

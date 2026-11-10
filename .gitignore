@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.venv-build/
+
+# Build (PyInstaller e FFmpeg baixado pelos scripts)
+build/
+dist/
+*.spec
+ffmpeg-bin/
+ffmpeg.tar.xz
+ffmpeg.zip
+ffmpeg-tmp/
+
+# IDE (configurações locais do JetBrains)
+.idea/workspace.xml
+.idea/shelf/
+.idea/httpRequests/
+.idea/dataSources*
+
+# Sistema
+.DS_Store
+Thumbs.db

@@ -12,18 +12,19 @@ $Py = ".\.venv-build\Scripts\python.exe"
 & $Py -m pip install -q -U pip
 & $Py -m pip install -q -U yt-dlp PySide6 pyinstaller
 
-if (-not (Test-Path "ffmpeg-bin\ffmpeg.exe")) {
+if (-not (Test-Path "ffmpeg-bin\ffmpeg.exe") -or -not (Test-Path "ffmpeg-bin\ffprobe.exe")) {
     Write-Host ">> Baixando FFmpeg"
     New-Item -ItemType Directory -Force "ffmpeg-bin" | Out-Null
     Invoke-WebRequest -Uri "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile "ffmpeg.zip"
     Expand-Archive "ffmpeg.zip" -DestinationPath "ffmpeg-tmp" -Force
-    Get-ChildItem "ffmpeg-tmp" -Recurse -Include "ffmpeg.exe" | Copy-Item -Destination "ffmpeg-bin"
+    Get-ChildItem "ffmpeg-tmp" -Recurse -Include "ffmpeg.exe", "ffprobe.exe" | Copy-Item -Destination "ffmpeg-bin"
     Remove-Item "ffmpeg.zip", "ffmpeg-tmp" -Recurse -Force
 }
 
 Write-Host ">> Empacotando"
 & $Py -m PyInstaller --noconfirm --clean --windowed --name $App `
     --add-binary "ffmpeg-bin\ffmpeg.exe;." `
+    --add-binary "ffmpeg-bin\ffprobe.exe;." `
     SomDeMala.py
 
 Compress-Archive -Path "dist\$App" -DestinationPath "dist\$App-windows.zip" -Force
